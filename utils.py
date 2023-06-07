@@ -254,7 +254,7 @@ def cells_to_bboxes(predictions, anchors, S, is_preds=True):
     return converted_bboxes.tolist()
 
 def postprocess(predictions, iou_threshold, anchors, threshold, device, is_preds=True):
-    batch_size = predictions[0].shape[0]
+    batch_size = predictions.shape[0]
     if is_preds:
         bboxes = [[] for _ in range(batch_size)]
         for i in range(3):
