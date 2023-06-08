@@ -1,218 +1,273 @@
-import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import numpy as np
-import torchvision
-import time
+import os
+import random
+import torch
 
-def xyxy2xywh(x):
-    # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-    y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
-    y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
-    y[:, 2] = x[:, 2] - x[:, 0]  # width
-    y[:, 3] = x[:, 3] - x[:, 1]  # height
-    return y
+from collections import Counter
+from tqdm import tqdm
 
-def xywh2xyxy(x):
-    # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
-    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-    y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
-    y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
-    y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
-    y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
-    return y
 
-def box_iou(box1, box2):
-    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
+def intersection_over_union(boxes_preds, boxes_labels, box_format="midpoint"):
     """
-    Return intersection-over-union (Jaccard index) of boxes.
-    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
-    Arguments:
-        box1 (Tensor[N, 4])
-        box2 (Tensor[M, 4])
-    Returns:
-        iou (Tensor[N, M]): the NxM matrix containing the pairwise
-            IoU values for every element in boxes1 and boxes2
-    """
+    Video explanation of this function:
+    https://youtu.be/XXYG5ZWtjj0
 
-    def box_area(box):
-        # box = 4xn
-        return (box[2] - box[0]) * (box[3] - box[1])
+    This function calculates intersection over union (iou) given pred boxes
+    and target boxes.
 
-    area1 = box_area(box1.T)
-    area2 = box_area(box2.T)
-
-    # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
-    inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
-    return inter / (area1[:, None] + area2 - inter) 
-
-def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
-                        labels=()):
-    """Runs Non-Maximum Suppression (NMS) on inference results
+    Parameters:
+        boxes_preds (tensor): Predictions of Bounding Boxes (BATCH_SIZE, 4)
+        boxes_labels (tensor): Correct labels of Bounding Boxes (BATCH_SIZE, 4)
+        box_format (str): midpoint/corners, if boxes (x,y,w,h) or (x1,y1,x2,y2)
 
     Returns:
-         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
+        tensor: Intersection over union for all examples
     """
 
-    nc = prediction.shape[2] - 5  # number of classes
-    xc = prediction[..., 4] > conf_thres  # candidates
+    if box_format == "midpoint":
+        box1_x1 = boxes_preds[..., 0:1] - boxes_preds[..., 2:3] / 2
+        box1_y1 = boxes_preds[..., 1:2] - boxes_preds[..., 3:4] / 2
+        box1_x2 = boxes_preds[..., 0:1] + boxes_preds[..., 2:3] / 2
+        box1_y2 = boxes_preds[..., 1:2] + boxes_preds[..., 3:4] / 2
+        box2_x1 = boxes_labels[..., 0:1] - boxes_labels[..., 2:3] / 2
+        box2_y1 = boxes_labels[..., 1:2] - boxes_labels[..., 3:4] / 2
+        box2_x2 = boxes_labels[..., 0:1] + boxes_labels[..., 2:3] / 2
+        box2_y2 = boxes_labels[..., 1:2] + boxes_labels[..., 3:4] / 2
 
-    # Settings
-    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
-    max_det = 300  # maximum number of detections per image
-    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
-    time_limit = 10.0  # seconds to quit after
-    redundant = True  # require redundant detections
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-    merge = False  # use merge-NMS
+    if box_format == "corners":
+        box1_x1 = boxes_preds[..., 0:1]
+        box1_y1 = boxes_preds[..., 1:2]
+        box1_x2 = boxes_preds[..., 2:3]
+        box1_y2 = boxes_preds[..., 3:4]
+        box2_x1 = boxes_labels[..., 0:1]
+        box2_y1 = boxes_labels[..., 1:2]
+        box2_x2 = boxes_labels[..., 2:3]
+        box2_y2 = boxes_labels[..., 3:4]
 
-    t = time.time()
-    output = [torch.zeros((0, 6), device=prediction.device)] * prediction.shape[0]
-    for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
-        x = x[xc[xi]]  # confidence
+    x1 = torch.max(box1_x1, box2_x1)
+    y1 = torch.max(box1_y1, box2_y1)
+    x2 = torch.min(box1_x2, box2_x2)
+    y2 = torch.min(box1_y2, box2_y2)
 
-        # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]):
-            l = labels[xi]
-            v = torch.zeros((len(l), nc + 5), device=x.device)
-            v[:, :4] = l[:, 1:5]  # box
-            v[:, 4] = 1.0  # conf
-            v[range(len(l)), l[:, 0].long() + 5] = 1.0  # cls
-            x = torch.cat((x, v), 0)
+    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    box1_area = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
 
-        # If none remain process next image
-        if not x.shape[0]:
-            continue
+    return intersection / (box1_area + box2_area - intersection + 1e-6)
 
-        # Compute conf
-        if nc == 1:
-            x[:, 5:] = x[:, 4:5] # for models with one class, cls_loss is 0 and cls_conf is always 0.5,
-                                 # so there is no need to multiplicate.
-        else:
-            x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
 
-        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-        box = xywh2xyxy(x[:, :4])
-
-        # Detections matrix nx6 (xyxy, conf, cls)
-        if multi_label:
-            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
-        else:  # best class only
-            conf, j = x[:, 5:].max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-
-        # Filter by class
-        if classes is not None:
-            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Apply finite constraint
-        # if not torch.isfinite(x).all():
-        #     x = x[torch.isfinite(x).all(1)]
-
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
-            continue
-        elif n > max_nms:  # excess boxes
-            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
-
-        # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        if i.shape[0] > max_det:  # limit detections
-            i = i[:max_det]
-        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-            weights = iou * scores[None]  # box weights
-            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-            if redundant:
-                i = i[iou.sum(1) > 1]  # require redundancy
-
-        output[xi] = x[i]
-        if (time.time() - t) > time_limit:
-            print(f'WARNING: NMS time limit {time_limit}s exceeded')
-            break  # time limit exceeded
-
-    return output
-
-def compute_mAP(targets, predictions, iou_threshold=0.5):
+def non_max_suppression(bboxes, iou_threshold, threshold, box_format="corners"):
     """
-    Compute the mean Average Precision (mAP) for bounding box predictions.
+    Video explanation of this function:
+    https://youtu.be/YDkjWEN8jNA
 
-    Args:
-        targets (List[List[List[float]]]): List of ground truth bounding box coordinates for each sample.
-                                           Format: [[[x_min, y_min, x_max, y_max], ...], ...]
-        predictions (List[List[List[float]]]): List of predicted bounding box coordinates for each sample.
-                                                Format: [[[x_min, y_min, x_max, y_max, confidence], ...], ...]
-        iou_threshold (float): Intersection over Union (IOU) threshold for matching predictions to targets.
+    Does Non Max Suppression given bboxes
+
+    Parameters:
+        bboxes (list): list of lists containing all bboxes with each bboxes
+        specified as [class_pred, prob_score, x1, y1, x2, y2]
+        iou_threshold (float): threshold where predicted bboxes is correct
+        threshold (float): threshold to remove predicted bboxes (independent of IoU)
+        box_format (str): "midpoint" or "corners" used to specify bboxes
 
     Returns:
-        float: mAP value.
+        list: bboxes after performing NMS given a specific IoU threshold
     """
-    num_samples = len(targets)
+
+    assert type(bboxes) == list
+
+    bboxes = [box for box in bboxes if box[1] > threshold]
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+    bboxes_after_nms = []
+
+    while bboxes:
+        chosen_box = bboxes.pop(0)
+
+        bboxes = [
+            box
+            for box in bboxes
+            if box[0] != chosen_box[0]
+            or intersection_over_union(
+                torch.tensor(chosen_box[2:]),
+                torch.tensor(box[2:]),
+                box_format=box_format,
+            )
+            < iou_threshold
+        ]
+
+        bboxes_after_nms.append(chosen_box)
+
+    return bboxes_after_nms
+
+
+def mean_average_precision(
+    pred_boxes, true_boxes, iou_threshold=0.5, box_format="midpoint", num_classes=20
+):
+    """
+    Video explanation of this function:
+    https://youtu.be/FppOzcDvaDI
+
+    This function calculates mean average precision (mAP)
+
+    Parameters:
+        pred_boxes (list): list of lists containing all bboxes with each bboxes
+        specified as [train_idx, class_prediction, prob_score, x1, y1, x2, y2]
+        true_boxes (list): Similar as pred_boxes except all the correct ones
+        iou_threshold (float): threshold where predicted bboxes is correct
+        box_format (str): "midpoint" or "corners" used to specify bboxes
+        num_classes (int): number of classes
+
+    Returns:
+        float: mAP value across all classes given a specific IoU threshold
+    """
+
+    # list storing all AP for respective classes
     average_precisions = []
 
-    for sample_idx in range(num_samples):
-        target_boxes = targets[sample_idx]
-        prediction_boxes = predictions[sample_idx]
+    # used for numerical stability later on
+    epsilon = 1e-6
 
-        num_targets = len(target_boxes)
-        num_predictions = len(prediction_boxes)
+    for c in range(num_classes):
+        detections = []
+        ground_truths = []
 
-        if num_targets == 0 or num_predictions == 0:
+        # Go through all predictions and targets,
+        # and only add the ones that belong to the
+        # current class c
+        for detection in pred_boxes:
+            if detection[1] == c:
+                detections.append(detection)
+
+        for true_box in true_boxes:
+            if true_box[1] == c:
+                ground_truths.append(true_box)
+
+        # find the amount of bboxes for each training example
+        # Counter here finds how many ground truth bboxes we get
+        # for each training example, so let's say img 0 has 3,
+        # img 1 has 5 then we will obtain a dictionary with:
+        # amount_bboxes = {0:3, 1:5}
+        amount_bboxes = Counter([gt[0] for gt in ground_truths])
+
+        # We then go through each key, val in this dictionary
+        # and convert to the following (w.r.t same example):
+        # ammount_bboxes = {0:torch.tensor[0,0,0], 1:torch.tensor[0,0,0,0,0]}
+        for key, val in amount_bboxes.items():
+            amount_bboxes[key] = torch.zeros(val)
+
+        # sort by box probabilities which is index 2
+        detections.sort(key=lambda x: x[2], reverse=True)
+        TP = torch.zeros((len(detections)))
+        FP = torch.zeros((len(detections)))
+        total_true_bboxes = len(ground_truths)
+
+        # If none exists for this class then we can safely skip
+        if total_true_bboxes == 0:
             continue
 
-        target_boxes = np.array(target_boxes)
-        prediction_boxes = np.array(prediction_boxes)
+        for detection_idx, detection in enumerate(detections):
+            # Only take out the ground_truths that have the same
+            # training idx as detection
+            ground_truth_img = [
+                bbox for bbox in ground_truths if bbox[0] == detection[0]
+            ]
 
-        sorted_indices = np.argsort(-prediction_boxes[:, -1])
-        prediction_boxes = prediction_boxes[sorted_indices]
+            num_gts = len(ground_truth_img)
+            best_iou = 0
 
-        true_positives = np.zeros(num_predictions)
-        false_positives = np.zeros(num_predictions)
-        matched_targets = set()
+            for idx, gt in enumerate(ground_truth_img):
+                iou = intersection_over_union(
+                    torch.tensor(detection[3:]),
+                    torch.tensor(gt[3:]),
+                    box_format=box_format,
+                )
 
-        for idx, prediction_box in enumerate(prediction_boxes):
-            predicted_box = prediction_box[:-1]
-            predicted_confidence = prediction_box[-1]
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = idx
 
-            ious = box_iou(predicted_box, target_boxes)
-            max_iou = np.max(ious)
-            max_iou_index = np.argmax(ious)
+            if best_iou > iou_threshold:
+                # only detect ground truth detection once
+                if amount_bboxes[detection[0]][best_gt_idx] == 0:
+                    # true positive and add this bounding box to seen
+                    TP[detection_idx] = 1
+                    amount_bboxes[detection[0]][best_gt_idx] = 1
+                else:
+                    FP[detection_idx] = 1
 
-            if max_iou >= iou_threshold and max_iou_index not in matched_targets:
-                true_positives[idx] = 1
-                matched_targets.add(max_iou_index)
+            # if IOU is lower then the detection is a false positive
             else:
-                false_positives[idx] = 1
+                FP[detection_idx] = 1
 
-        cumsum_true_positives = np.cumsum(true_positives)
-        cumsum_false_positives = np.cumsum(false_positives)
+        TP_cumsum = torch.cumsum(TP, dim=0)
+        FP_cumsum = torch.cumsum(FP, dim=0)
+        recalls = TP_cumsum / (total_true_bboxes + epsilon)
+        precisions = TP_cumsum / (TP_cumsum + FP_cumsum + epsilon)
+        precisions = torch.cat((torch.tensor([1]), precisions))
+        recalls = torch.cat((torch.tensor([0]), recalls))
+        # torch.trapz for numerical integration
+        average_precisions.append(torch.trapz(precisions, recalls))
 
-        precision = cumsum_true_positives / (cumsum_true_positives + cumsum_false_positives + 1e-16)
-        recall = cumsum_true_positives / num_targets
+    return sum(average_precisions) / len(average_precisions)
 
-        recall = np.concatenate(([0.0], recall, [1.0]))
-        precision = np.concatenate(([0.0], precision, [0.0]))
+def get_evaluation_bboxes(
+    loader,
+    model,
+    iou_threshold,
+    anchors,
+    threshold,
+    box_format="midpoint",
+    device="cuda",
+):
+    # make sure model is in eval before get bboxes
+    model.eval()
+    train_idx = 0
+    all_pred_boxes = []
+    all_true_boxes = []
+    for batch_idx, (x, labels) in enumerate(tqdm(loader)):
+        x = x.to(device)
 
-        # Compute the interpolated precision
-        for i in range(len(precision) - 1, 0, -1):
-            precision[i - 1] = np.maximum(precision[i - 1], precision[i])
+        with torch.no_grad():
+            predictions = model(x)
 
-        # Compute Average Precision (AP)
-        ap = np.sum((recall[1:] - recall[:-1]) * precision[:-1])
+        batch_size = x.shape[0]
+        bboxes = [[] for _ in range(batch_size)]
+        for i in range(3):
+            S = predictions[i].shape[2]
+            anchor = torch.tensor([*anchors[i]]).to(device) * S
+            boxes_scale_i = cells_to_bboxes(
+                predictions[i], anchor, S=S, is_preds=True
+            )
+            for idx, (box) in enumerate(boxes_scale_i):
+                bboxes[idx] += box
 
-        average_precisions.append(ap)
+        # we just want one bbox for each label, not one for each scale
+        true_bboxes = cells_to_bboxes(
+            labels[2], anchor, S=S, is_preds=False
+        )
 
-    if len(average_precisions) == 0:
-        return 0.0
+        for idx in range(batch_size):
+            nms_boxes = non_max_suppression(
+                bboxes[idx],
+                iou_threshold=iou_threshold,
+                threshold=threshold,
+                box_format=box_format,
+            )
 
-    mAP = np.mean(average_precisions)
-    return mAP
+            for nms_box in nms_boxes:
+                all_pred_boxes.append([train_idx] + nms_box)
+
+            for box in true_bboxes[idx]:
+                if box[1] > threshold:
+                    all_true_boxes.append([train_idx] + box)
+
+            train_idx += 1
+
+    model.train()
+    return all_pred_boxes, all_true_boxes
+
 
 def cells_to_bboxes(predictions, anchors, S, is_preds=True):
     """
@@ -253,21 +308,46 @@ def cells_to_bboxes(predictions, anchors, S, is_preds=True):
     converted_bboxes = torch.cat((best_class, scores, x, y, w_h), dim=-1).reshape(BATCH_SIZE, num_anchors * S * S, 6)
     return converted_bboxes.tolist()
 
-def postprocess(predictions, iou_threshold, anchors, threshold, device, is_preds=True):
-    batch_size = predictions.shape[0]
-    if is_preds:
-        bboxes = [[] for _ in range(batch_size)]
-        for i in range(3):
-            S = predictions[i].shape[2]
-            anchor = torch.tensor([*anchors[i]]).to(device) * S
-            boxes_scale_i = cells_to_bboxes(predictions[i], anchor, S=S, is_preds=True)
-            bboxes += boxes_scale_i
+def plot_image(image, boxes):
+    """Plots predicted bounding boxes on the image"""
+    cmap = plt.get_cmap("tab20b")
+    class_labels = ['person']
+    colors = [cmap(i) for i in np.linspace(0, 1, len(class_labels))]
+    im = np.array(image)
+    height, width, _ = im.shape
 
-    else:
-        S = predictions[2].shape[2]
-        bboxes = cells_to_bboxes(predictions, anchors, S=S, is_preds=False)
-    
-    for idx in range(batch_size):
-        bboxes[idx] = non_max_suppression(bboxes[idx], iou_thres=iou_threshold, conf_thres=threshold)
-    
-    return bboxes
+    # Create figure and axes
+    fig, ax = plt.subplots(1)
+    # Display the image
+    ax.imshow(im)
+
+    # box[0] is x midpoint, box[2] is width
+    # box[1] is y midpoint, box[3] is height
+
+    # Create a Rectangle patch
+    for box in boxes:
+        assert len(box) == 6, "box should contain class pred, confidence, x, y, width, height"
+        class_pred = box[0]
+        box = box[2:]
+        upper_left_x = box[0] - box[2] / 2
+        upper_left_y = box[1] - box[3] / 2
+        rect = patches.Rectangle(
+            (upper_left_x * width, upper_left_y * height),
+            box[2] * width,
+            box[3] * height,
+            linewidth=2,
+            edgecolor=colors[int(class_pred)],
+            facecolor="none",
+        )
+        # Add the patch to the Axes
+        ax.add_patch(rect)
+        plt.text(
+            upper_left_x * width,
+            upper_left_y * height,
+            s=class_labels[int(class_pred)],
+            color="white",
+            verticalalignment="top",
+            bbox={"color": colors[int(class_pred)], "pad": 0},
+        )
+
+    plt.show()
